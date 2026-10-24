@@ -1,0 +1,26 @@
+.env
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+venv/
+.venv/
+lora_adapter/
+data/
+results_*.csv
+*.pt
+*.safetensors
+
+# Hard-coded credentials — never commit
+local_secrets.py
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Large run outputs and data (kept local, not published)
+artifacts/
+cache/
+releases/
+feedback/

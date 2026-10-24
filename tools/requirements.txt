@@ -1,0 +1,24 @@
+# Versions the pipeline was tested with (smoke mode, CPU). Install torch for your CUDA first:
+#   https://pytorch.org/get-started/locally/   (tested: torch==2.14.0)
+transformers==5.17.0
+trl==1.14.0
+peft==0.21.0
+accelerate==1.15.0
+datasets==5.0.1
+tokenizers==0.23.2
+safetensors==0.8.0
+lightgbm==4.7.0
+shap==0.51.0
+scikit-learn==1.8.0
+statsmodels==0.15.0
+pandas==3.0.2
+pyarrow==25.0.1
+numpy==2.4.4
+scipy==1.17.1
+matplotlib==3.10.9
+nbformat
+nbclient
+ipykernel
+pytest
+# optional: QLoRA (cfg.load_in_4bit=True) needs CUDA + bitsandbytes
+# bitsandbytes
