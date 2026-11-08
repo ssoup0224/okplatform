@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import random
+import re
 import subprocess
 import urllib.request
 from dataclasses import dataclass
@@ -868,6 +869,207 @@ def read_aihub_dir(directory: Path) -> list[dict]:
 
 
 # ======================================================================================
+# Parsers added 2026-10-28: WildChat Korean, MTID (TurnGate), AIHub 71833 [D60][D61][D62]
+# ======================================================================================
+WILDCHAT_REPO = "allenai/WildChat-4.8M"
+WILDCHAT_COLUMNS = ["conversation_hash", "conversation", "language", "toxic", "redacted", "turn"]
+
+
+def parse_wildchat(rows, source="wildchat_ko", min_user_turns: int = 2):
+    """allenai/WildChat-4.8M (non-toxic release, ODC-BY): real users' chats with GPT models, fields
+    conversation_hash, language, toxic, redacted and conversation [{role, content, ...}] [R84].
+    Korean conversations become benign history material (S02b screens them again with the zero-shot
+    guard, as for koVast). Toxic or PII-redacted conversations are skipped. [D60]"""
+    out = []
+    for r in rows:
+        if r.get("toxic") or r.get("redacted") or str(r.get("language")) != "Korean":
+            continue
+        msgs = _turns_from_sharegpt_or_chatml(r.get("conversation") or [])
+        n = sum(m["role"] == "user" for m in msgs)
+        if n < max(1, min_user_turns):
+            continue
+        key = r.get("conversation_hash") or text_key(msgs[0]["content"])
+        out.append(make_conv(source=source, messages=msgs, label3=["Safe"] * n, category=[None] * n, lang="ko",
+                             seed_id=f"wildchat:{key}", family="history", pool="history", license="ODC-BY",
+                             commercial_ok=True, label_origin="model"))
+    return out
+
+
+MTID_LICENSE = "AGPL-3.0 (TurnGate repo; dataset licence not stated)"
+
+
+def _mtid_pick(rows, max_rollouts: int | None):
+    """At most `max_rollouts` rollouts per seed (rollouts of one seed are near-duplicates)."""
+    by_seed: dict = {}
+    for r in rows:
+        by_seed.setdefault(r.get("sample_index"), []).append(r)
+    out = []
+    for _, g in sorted(by_seed.items(), key=lambda kv: str(kv[0])):
+        g = sorted(g, key=lambda r: (r.get("rollout_id") is None, r.get("rollout_id")))
+        out += g[: max_rollouts] if max_rollouts else g
+    return out
+
+
+def parse_mtid(rows, kind: str, source="mtid", fixed_role=None, max_rollouts: int | None = None):
+    """MTID (Graph-COM/TurnGate, dataset/gpt52-gen_filter/<kind>_<split>.jsonl) [R85]. Each row is one
+    rollout: sample_index (seed), rollout_id, meta_intent, conversation [{turn_id, role, content}].
+    Harmful rollouts end at `target_turn`, the first user turn after which the dialogue is enough to
+    enable harm (the "closure turn"): that turn -> Unsafe, earlier user turns unknown [D6] (the paper
+    passes them, but under our policy intent may already show). Benign rollouts: every turn Safe.
+    seed = sample_index, so the 20 rollouts of one seed never cross splits. [D61]"""
+    assert kind in ("harmful", "benign")
+    out = []
+    for r in _mtid_pick(rows, max_rollouts):
+        msgs = _turns_from_sharegpt_or_chatml(r.get("conversation") or [], merge_same_role=False)
+        seed = f"mtid:{kind}:{r.get('sample_index')}"
+        if kind == "harmful":
+            k = r.get("target_turn")
+            user_idx = [i for i, m in enumerate(msgs) if m["role"] == "user"]
+            if isinstance(k, int) and 1 <= k <= len(user_idx):
+                msgs = msgs[: user_idx[k - 1] + 1]
+            # category left Unknown: the base guard (teacher) fills it before SFT [D19]; MTID's own domain
+            # tag (chemistry / cybersecurity) cannot be joined to the rollouts reliably
+            c = _native_attack(source, msgs, None, "en", seed, MTID_LICENSE, False, fixed_role=fixed_role)
+        else:
+            msgs = _truncate_to_last_user(msgs)
+            n = sum(m["role"] == "user" for m in msgs)
+            c = make_conv(source=source, messages=msgs, label3=["Safe"] * n, category=[None] * n, lang="en",
+                          seed_id=seed, family="benign_native", pool="native_benign", license=MTID_LICENSE,
+                          commercial_ok=False, fixed_role=fixed_role, label_origin="model") if n else None
+        if c:
+            out.append(c)
+    return out
+
+
+# ---- AIHub 71833 (LLM 학습용 데이터 내 유해표현 검출) ---------------------------------------
+# Stage-2 file: one sentence column + 12 columns scored 0-3 (11 harm categories + 정상) [R86].
+# The exact header spelling is not published on the dataset page, so columns are matched by
+# keyword; an unmatched file raises with the headers it found.
+AIHUB71833_CATS = {                      # canonical name -> keywords matched in the normalised header
+    "모욕": ("모욕", "insult"), "욕설": ("욕설", "profan", "curse", "abuse"), "외설": ("외설", "음란", "obscen"),
+    "장애": ("장애", "disab"), "인종/지역": ("인종", "지역", "race", "region"), "연령": ("연령", "나이", "age"),
+    "종교": ("종교", "relig"), "정치성향": ("정치", "polit"), "직업": ("직업", "occup", "job"),
+    "성혐오": ("성혐오", "성별", "gender", "sexhate", "misogyn"), "폭력위협/범죄조장": ("폭력", "위협", "범죄", "violen", "threat", "crime"),
+    "정상": ("정상", "normal", "clean", "none"),
+}
+AIHUB71833_GROUP = ("장애", "인종/지역", "연령", "종교", "직업", "성혐오")
+AIHUB71833_TEXT = ("문장", "content", "text", "sentence", "내용", "발화", "comment")
+
+
+def _norm_header(h) -> str:
+    return re.sub(r"[\s_\-/()\[\]]", "", str(h)).lower()
+
+
+def aihub71833_columns(headers) -> tuple[str | None, dict]:
+    """(text column, {canonical category: column}) for a stage-2 table; ({}, None) if not stage-2."""
+    cats: dict = {}
+    for h in headers:
+        nh = _norm_header(h)
+        if any(nh == _norm_header(t) for t in AIHUB71833_TEXT):
+            continue
+        for name, kws in AIHUB71833_CATS.items():
+            if name not in cats and any(k in nh for k in kws):
+                if name == "성혐오" and "정치" in nh:         # '정치성향' contains '성' but is politics
+                    continue
+                cats[name] = h
+                break
+    text = next((h for h in headers if any(_norm_header(h) == _norm_header(t) for t in AIHUB71833_TEXT)), None)
+    if text is None:
+        rest = [h for h in headers if h not in cats.values()]
+        text = rest[0] if rest else None
+    return text, cats
+
+
+def _score(v) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if x != x else x                       # NaN -> 0
+
+
+def aihub71833_label(scores: dict, unsafe_min: int = 2) -> tuple[str | None, str | None]:
+    """Scores (0-3) per category -> (label3, category), following D4 (rude but not hateful ->
+    Controversial): violent threat / crime incitement -> Unsafe; group hate or obscenity >= unsafe_min ->
+    Unsafe; any lower-scored harm, insult or profanity -> Controversial; political leaning only ->
+    Controversial; nothing flagged -> Safe if marked 정상 (or no 정상 column), else dropped. [D62]"""
+    s = {k: _score(v) for k, v in scores.items()}
+    if s.get("폭력위협/범죄조장", 0) >= 1:
+        return "Unsafe", "Violent"
+    group = max([s.get(c, 0) for c in AIHUB71833_GROUP] or [0])
+    if group >= unsafe_min:
+        return "Unsafe", "Unethical Acts"
+    if s.get("외설", 0) >= unsafe_min:
+        return "Unsafe", "Sexual Content or Sexual Acts"
+    if s.get("외설", 0) >= 1:
+        return "Controversial", "Sexual Content or Sexual Acts"
+    if group >= 1 or s.get("모욕", 0) >= 1 or s.get("욕설", 0) >= 1:
+        return "Controversial", "Unethical Acts"
+    if s.get("정치성향", 0) >= 1:
+        return "Controversial", "Politically Sensitive Topics"
+    if "정상" in s and s["정상"] <= 0:
+        return None, None                              # nothing flagged and not marked normal: unlabelled
+    return "Safe", None
+
+
+# De-identification tags (#@이름#, ...) appear only in harmful rows; names are substituted, rows with any
+# other tag (e.g. #@링크#, ~70 rows) are dropped. A fixed list keeps the substitution deterministic.
+AIHUB71833_NAMES = ("김민준", "이서연", "박지훈", "최수빈", "정예준", "강하은", "조현우", "윤지민", "장도윤", "임서윤",
+                    "한지호", "오민서", "서준영", "신유진", "권태현", "황수아", "안재민", "송다은", "류승현", "홍지아")
+
+
+def clean_aihub71833_text(t: str) -> str | None:
+    """Remove annotation artefacts that exist ONLY in the harmful rows of AIHub 71833 and would be learnt
+    as label cues [D62]: the ''span''' marks around the harmful words (86% of harmful rows, 0% of normal),
+    the de-identification tags (#@이름#: 30% vs 0%) and stray whitespace (newlines, double / trailing
+    spaces: 8-10% vs < 0.5%). Returns None for rows whose tags cannot be replaced."""
+    t = re.sub(r"'{2,}", "", str(t))
+    k = int(text_key(t)[:8], 16)
+    t = re.sub(r"#@[^#\s]{0,10}이름[^#\s]{0,10}#",
+               lambda m: AIHUB71833_NAMES[(k + m.start()) % len(AIHUB71833_NAMES)], t)
+    if "#@" in t:
+        return None
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or None
+
+
+def parse_aihub71833(df: pd.DataFrame, source="aihub_71833", unsafe_min: int = 2,
+                     keep_safe: bool = False) -> list[dict]:
+    """keep_safe=False (default): only the harmful half (Controversial / Unsafe) is used. The 정상 half is
+    formal written text from other corpora (0% 'ㅋ', 0.2% '?' vs 11% / 27% in the harmful news comments),
+    so keeping it would teach "comment style = harmful"; Safe comments come from K-HATERS, K-MHaS and
+    BEEP instead. [D62]"""
+    text_col, cats = aihub71833_columns(list(df.columns))
+    if text_col is None or len(cats) < 6:
+        raise ValueError(f"AIHub 71833: could not map the stage-2 columns (found {list(df.columns)}); "
+                         "update AIHUB71833_CATS / AIHUB71833_TEXT in okg/data_sources.py")
+    out = []
+    for r in df.to_dict("records"):
+        t = r.get(text_col)
+        if not isinstance(t, str) or not t.strip():
+            continue
+        label, cat = aihub71833_label({name: r.get(col) for name, col in cats.items()}, unsafe_min)
+        if label is None or (label == "Safe" and not keep_safe):
+            continue
+        t = clean_aihub71833_text(t)
+        if t is None:
+            continue
+        out.append(single_turn(source, t, label, cat, "ko", f"aihub71833:{text_key(t)}", "comment",
+                               "AIHub-policy", False, family="comment"))
+    return out
+
+
+def read_csv_any(p: Path) -> pd.DataFrame:
+    """AIHub CSVs are UTF-8 (with or without BOM) or CP949."""
+    for enc in ("utf-8-sig", "cp949", "euc-kr"):
+        try:
+            return pd.read_csv(p, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(p, encoding="utf-8", encoding_errors="replace")
+
+
+# ======================================================================================
 # Registry
 # ======================================================================================
 
@@ -1216,12 +1418,131 @@ def L_aihub558(cfg):
     return parse_aihub_talksets(talksets)
 
 
+def wildchat_korean_rows(cfg, need: int) -> list[dict]:
+    """Korean conversations of allenai/WildChat-4.8M without loading 15 GB at once [D60]: shards are
+    visited in a seeded random order, one at a time; per row group only the `language` column is read
+    first, then the needed columns of the Korean rows. Each shard's Korean rows are cached as a small
+    JSONL (so an interrupted scan resumes) and the downloaded shard is deleted. Stops once `need` usable
+    rows are cached. Downloads up to the whole ~15 GB once; nothing large stays on disk."""
+    import shutil
+    import tempfile
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
+
+    cache = cfg.cache_dir / "wildchat_ko"
+    cache.mkdir(parents=True, exist_ok=True)
+    files = sorted(f for f in HfApi().list_repo_files(WILDCHAT_REPO, repo_type="dataset", token=cfg.hf_token)
+                   if f.endswith(".parquet"))
+    random.Random(cfg.seed).shuffle(files)
+    rows: list[dict] = []
+    for i, f in enumerate(files):
+        part = cache / (f.replace("/", "__") + ".ko.jsonl")
+        if not part.exists():
+            tmpdir = Path(tempfile.mkdtemp(dir=cache))
+            try:
+                local = hf_hub_download(WILDCHAT_REPO, f, repo_type="dataset", token=cfg.hf_token, local_dir=tmpdir)
+                pf = pq.ParquetFile(local)
+                kept = []
+                for rg in range(pf.num_row_groups):
+                    lang = pf.read_row_group(rg, columns=["language"]).column("language").to_pylist()
+                    idx = [j for j, l in enumerate(lang) if l == "Korean"]
+                    if not idx:
+                        continue
+                    tbl = pf.read_row_group(rg, columns=WILDCHAT_COLUMNS).take(idx)
+                    for r in tbl.to_pylist():
+                        r["conversation"] = [{"role": t.get("role"), "content": t.get("content")}
+                                             for t in (r.get("conversation") or [])]
+                        kept.append(r)
+                tmp = part.with_name(part.name + ".tmp")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    for r in kept:
+                        fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+                os.replace(tmp, part)
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        rows += read_jsonl_lenient(part)[0]
+        usable = sum(1 for r in rows if not r.get("toxic") and not r.get("redacted")
+                     and (r.get("turn") or 0) >= cfg.wildchat_min_user_turns)
+        print(f"  wildchat_ko: shard {i + 1}/{len(files)} -> {usable} usable Korean conversations", flush=True)
+        if usable >= need:
+            break
+    return rows
+
+
+def L_wildchat_ko(cfg):
+    need = int(cfg.wildchat_ko_max_conversations * 1.3)      # headroom for the quality filters
+    if os.environ.get("OKG_FIXTURE_DIR"):                   # offline tests only
+        rows = hf_rows(WILDCHAT_REPO, None, "train", cfg.hf_token,
+                       where=lambda b: [l == "Korean" for l in b["language"]])
+    else:
+        rows = wildchat_korean_rows(cfg, need)
+    out = parse_wildchat(rows, "wildchat_ko", cfg.wildchat_min_user_turns)
+    return _cap(out, cfg.wildchat_ko_max_conversations, cfg.seed)
+
+
+MTID_PATH = "Graph-COM/TurnGate/main/dataset/gpt52-gen_filter"
+
+
+def _mtid_rows(cfg, kind: str, split: str) -> list[dict]:
+    if os.environ.get("OKG_FIXTURE_DIR"):                   # offline tests only
+        p = Path(os.environ["OKG_FIXTURE_DIR"]) / "mtid" / f"{kind}_{split}.jsonl"
+    else:
+        p = _gh(cfg, f"{MTID_PATH}/{kind}_{split}.jsonl")
+    rows, bad = read_jsonl_lenient(p)
+    if bad:
+        print(f"  skipped {bad} malformed JSON line(s) in MTID {kind}_{split}")
+    return rows
+
+
+def L_mtid_train(cfg):
+    """MTID train + valid seeds (disjoint from its test seeds) -> normal group split [D61]."""
+    out = []
+    for kind in ("harmful", "benign"):
+        rows = _mtid_rows(cfg, kind, "train") + _mtid_rows(cfg, kind, "valid")
+        out += parse_mtid(rows, kind, "mtid", max_rollouts=cfg.mtid_rollouts_per_sample)
+    return _cap(out, cfg.rows_per_source_cap, cfg.seed)
+
+
+def L_mtid_test(cfg):
+    out = []
+    for kind in ("harmful", "benign"):
+        out += parse_mtid(_mtid_rows(cfg, kind, "test"), kind, "mtid_test", fixed_role="test",
+                          max_rollouts=cfg.mtid_rollouts_per_sample)
+    return out
+
+
+def L_aihub71833(cfg):
+    """AIHub 71833 harmful-expression sentences, downloaded on YOUR server with aihubshell [D62].
+    Only the stage-2 CSV (categories) is used; stage-1 (binary, no category) is ignored. Rows are parsed
+    and cleaned first, then capped, so the cap counts usable rows."""
+    d = cfg.aihub_dir / str(cfg.aihub71833_datasetkey)
+    if os.environ.get("OKG_FIXTURE_DIR"):                      # offline tests only
+        d = Path(os.environ["OKG_FIXTURE_DIR"]) / "aihub" / str(cfg.aihub71833_datasetkey)
+    csvs = sorted(Path(d).rglob("*.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"no AIHub 71833 CSV under {d} — run the AIHub download cell first")
+    frames = []
+    for p in csvs:
+        df = read_csv_any(p)
+        if len(aihub71833_columns(list(df.columns))[1]) >= 6:
+            frames.append(df)
+    if not frames:
+        raise ValueError(f"AIHub 71833: no stage-2 CSV among {[p.name for p in csvs]}; headers of the first: "
+                         f"{list(read_csv_any(csvs[0]).columns)}")
+    df = pd.concat(frames, ignore_index=True)
+    out = parse_aihub71833(df, "aihub_71833", cfg.aihub71833_unsafe_min_score, cfg.aihub71833_keep_safe)
+    return _cap(out, cfg.aihub71833_max_rows, cfg.seed)
+
+
 REGISTRY: list[Source] = [
     # ---- training material: Korean ----
     Source("wgm_ko_train", L_wgm_train, "train", True, origin="model", note="KO+EN pairs, WildGuardMix-KO [R24]"),
     Source("wjb_ko_train", L_wjb_train, "train", True, origin="template", note="KO+EN WildJailbreak [R62]"),
     Source("polyguardmix", L_polyguardmix, "train", False, origin="model", note="KO+EN slice, guard_train only [R63]"),
     Source("aihub_558", L_aihub558, "train", False, origin="human", note="native KO multi-turn, needs aihubshell [R76]"),
+    Source("aihub_71833", L_aihub71833, "train", False, origin="model",
+           note="KO harmful-expression sentences, 11 categories, needs aihubshell [R86]"),
     Source("kmhas", L_kmhas, "train", True, note="KO hate comments [R27]"),
     Source("k_haters", L_khaters, "train", True, note="KO hate comments [R29]"),
     Source("kold", L_kold, "train", False, note="KO offensive comments, license unknown [R28]"),
@@ -1242,10 +1563,14 @@ REGISTRY: list[Source] = [
     Source("orbench_80k", L_orbench80k, "train", True, origin="model", note="EN over-refusal hard negatives [R32]"),
     Source("safemt_1k", L_safemt, "train", True, origin="template", note="EN multi-turn ActorAttack dialogues [R21]"),
     Source("xguard", L_xguard, "train", False, origin="template", gated=True, note="EN multi-turn X-Teaming [R22]"),
+    Source("mtid", L_mtid_train, "train", False, origin="model",
+           note="EN multi-turn attacks labelled at the closure turn + benign twins (TurnGate) [R85]"),
     Source("kotox_instr", L_kotox_instr, "train", True, enabled_by_default=False, origin="template", note="see D11"),
     # ---- benign history material ----
     Source("ultrachat_train", L_ultra_hist, "history", True, origin="model", note="EN benign multi-turn [R31]"),
     Source("kovast", L_kovast, "history", True, origin="model", note="KO benign multi-turn, screened in S02b [R71]"),
+    Source("wildchat_ko", L_wildchat_ko, "history", True, origin="model",
+           note="KO real-user multi-turn chats (non-toxic WildChat-4.8M), screened in S02b [R84]"),
     Source("koalpaca", L_koalpaca, "history", False, note="KO benign pairs, license unspecified [R42]"),
     Source("square_resp", L_square_resp, "history", True, note="KO acceptable responses [R30]"),
     # ---- evaluation only ----
@@ -1272,6 +1597,7 @@ REGISTRY: list[Source] = [
     Source("ultrachat_test", L_ultra_test, "eval", True, origin="model"),
     Source("mhj", L_mhj, "eval", False, gated=True, note="gated, CC-BY-NC-4.0 [R23]"),
     Source("dktc", L_dktc, "eval", False, note="CC-BY-NC-SA [DKTC README]"),
+    Source("mtid_test", L_mtid_test, "eval", False, origin="model", note="MTID test seeds, turn-level latency [R85]"),
 ]
 
 

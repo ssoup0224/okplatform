@@ -29,6 +29,7 @@ Labels map to Qwen3Guard's `Safe / Unsafe / Controversial` plus one of its 9 cat
 | wjb_ko_train | HF `iknow-lab/wildjailbreak-train-ko` (261k, capped) | prompt_ko, vanilla, adversarial, data_type | adversarial_harmful → Unsafe/Jailbreak; vanilla_harmful → Unsafe (teacher category); *_benign → Safe; seed = vanilla text | ODC-BY (yes) |
 | polyguardmix | HF `ToxicityPrompts/PolyGuardMix`, Korean + English rows only (filtered on disk) | prompt, prompt_harm_label, prompt_safety_categories, metadata.language | yes → Unsafe (S-codes → category); no → Safe; fixed to guard_train | unverified (treated NC) |
 | aihub_558 | AIHub 558 via `aihubshell`, label JSON only (needs `AIHUB_API_KEY`) | talkset id, sentences[].speaker/text/is_immoral/types/intensity | see D41 (native KO multi-turn, human labels) | AIHub policy (no) |
+| aihub_71833 | AIHub 71833 via `aihubshell` (needs `AIHUB_API_KEY` and approval; Korean nationals only), `stage2_data.csv` (200k rows), harmful half only, capped at 50k | 문장 + 모욕, 욕설, 외설, 폭력위협/범죄조장, 성혐오, 연령, 인종/지역, 장애, 종교, 정치성향, 직업 (0–3), 정상 (0/1) | violent threat ≥ 1 → Unsafe/Violent; group hate or 외설 ≥ 2 → Unsafe; lower scores, 모욕/욕설, 정치성향 → Controversial. The 정상 half is formal text from other corpora and is left out (style shortcut, `aihub71833_keep_safe`). Annotation artefacts that exist only in harmful rows are removed: `''span'''` marks (86%), `#@이름#` tags (30%, replaced by names; other tags dropped), stray whitespace (D62) | AIHub policy (no) |
 | kmhas | GitHub K-Guardrail `KMHaS.jsonl` | query, topic | protected-group discrimination → Unsafe; profanity or politics only → Controversial; none → Safe | CC-BY-SA-4.0 (yes) |
 | k_haters | HF `humane-lab/K-HATERS` | text, label | L2_hate → Unsafe; L1_hate and offensive → Controversial; normal → Safe | CC-BY-4.0 (yes) |
 | kold | GitHub K-Guardrail `KOLD.jsonl` | query, blocked | offensive → Controversial; else Safe | unknown (no) |
@@ -47,13 +48,15 @@ Labels map to Qwen3Guard's `Safe / Unsafe / Controversial` plus one of its 9 cat
 | do_not_answer | HF `LibrAI/do-not-answer` | question, risk_area | Unsafe by risk area; chatbot-interaction harms → Controversial | Apache-2.0 (yes) |
 | orbench_80k | HF `bench-llm/or-bench` or-bench-80k | prompt | Safe (over-refusal hard negatives) | CC-BY-4.0 (yes) |
 | safemt_1k | HF `SafeMTData/SafeMTData` SafeMTData_1K | conversations, query_id | last user turn Unsafe; earlier turns Unknown | MIT (yes) |
-| xguard | HF `marslabucla/XGuard-Train` (gated) | conversations | last turn Unsafe; fixed to guard_train | unverified (no) |
+| xguard | HF `marslabucla/XGuard-Train` (gated), all ~30.7k (D59) | conversations | last turn Unsafe; fixed to guard_train | unverified (no) |
+| mtid | GitHub `Graph-COM/TurnGate` `dataset/gpt52-gen_filter/{harmful,benign}_{train,valid}.jsonl`, ≤ 5 rollouts per seed | sample_index, rollout_id, target_turn, meta_intent, conversation | harmful: cut at `target_turn` → Unsafe, earlier turns Unknown, category from the teacher; benign twins: all Safe (D61) | AGPL-3.0 repo, data licence unstated (no) |
 
 ## Benign multi-turn history (screened by the zero-shot guard in S02b)
 | source | where | notes |
 |---|---|---|
 | ultrachat_train | HF `HuggingFaceH4/ultrachat_200k` train_sft | EN, MIT |
 | kovast | HF `maywell/koVast` | KO, MIT, `conversations[{from,value}]` |
+| wildchat_ko | HF `allenai/WildChat-4.8M` (non-toxic release), `language == "Korean"`, not redacted, ≥ 2 user turns, 12k | KO real users, ODC-BY; shards scanned one at a time, Korean rows cached in `cache/wildchat_ko/` (D60). The first run downloads up to ~15 GB once; nothing large is kept |
 | koalpaca | HF `beomi/KoAlpaca-v1.1a` | KO single pairs, licence unspecified |
 | square_resp | SQuARe response_train.json (acceptable?=1) | KO |
 
@@ -69,6 +72,7 @@ Labels map to Qwen3Guard's `Safe / Unsafe / Controversial` plus one of its 9 cat
 | unsmile_valid, beep_dev, apeach, kotox_test (easy/normal/hard) | KO hate/offensive, including obfuscated text |
 | csrt, redteam_kr, raccoon_kr, square_test_ood | code-switching, KO red-team, KO sensitive-safe |
 | orbench_hard, orbench_toxic, ultrachat_test | EN over-refusal / toxic / benign multi-turn |
+| mtid_test | MTID's own test seeds (60 harmful + 60 benign, ≤ 5 rollouts each): turn-level detection latency. Seeds derive from WildJailbreak vanilla prompts, so overlap with wjb_ko_train may make it slightly optimistic |
 | mhj, dktc | human multi-turn attacks (EN) and threatening dialogues (KO); NC. MHJ ships the attacker's turns only (no model replies); since D44 consecutive user turns stay separate (before, each attack was merged into one message) |
 
 ## Considered and excluded

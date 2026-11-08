@@ -53,8 +53,12 @@ def stage_sources(cfg: Config, runner: StageRunner, force: bool = False) -> Path
               and (cfg.allow_noncommercial or s.commercial_ok)]
     params = cfg.subset("rows_per_source_cap", "xguard_max_conversations", "ultrachat_max_conversations",
                         "kovast_max_conversations", "aihub_max_talksets", "seed", "allow_noncommercial",
-                        "disabled_sources", "custom_sources", "run_mode")
+                        "disabled_sources", "custom_sources", "run_mode", "wildchat_ko_max_conversations",
+                        "wildchat_min_user_turns", "mtid_rollouts_per_sample", "aihub71833_max_rows",
+                        "aihub71833_unsafe_min_score", "aihub71833_keep_safe")
     params["aihub_files_present"] = (cfg.aihub_dir / str(cfg.aihub_datasetkey) / "_DONE").exists()
+    params["aihub71833_files_present"] = (cfg.aihub_dir / str(cfg.aihub71833_datasetkey) / "_DONE").exists()
+    params["code"] = code_hash("data_sources", "schema", "quality")   # parser fixes re-run S01 [D59]
     params["sources"] = [s.name for s in active]
     params["hf_token_present"] = cfg.hf_token is not None   # adding a token re-runs the loaders
     if cfg.feedback_to_guard_train:                            # monthly path: reviewed traffic also trains the adapter [D34]
@@ -298,7 +302,8 @@ def stage_translate(cfg: Config, runner: StageRunner, force: bool = False) -> Pa
             return {"translated": 0, "note": "disabled"}
         from .translate import translate_convs
         convs = _read(runner, "S02b_screen", "convs.parquet")
-        attacks = convs[convs["source"].isin(["safemt_1k", "xguard"])]
+        attacks = convs[convs["source"].isin(["safemt_1k", "xguard", "mtid"])     # + MTID attacks [D61]
+                        & (convs["t_attack"] >= 0)]                                  # (not MTID's benign twins)
         attacks = attacks.sample(min(len(attacks), cfg.translate_max_conversations), random_state=cfg.seed)
         benign = convs[(convs["source"] == "ultrachat_train")].copy()
         benign = benign.sample(min(len(benign), len(attacks)), random_state=cfg.seed)
@@ -852,7 +857,8 @@ def stage_llamaguard(cfg: Config, runner: StageRunner, force: bool = False) -> P
     verdict token [R47]. The text before the verdict (whitespace) is detected from one greedy generation
     instead of being assumed, and the null `attention_chunk_size` of the released config is set, as in the
     previous Llama Guard 4 project. [D25]"""
-    params = cfg.subset("llamaguard_model", "llamaguard_max_stack_benign", "score_batch_size", "seed", "run_mode")
+    params = cfg.subset("llamaguard_model", "llamaguard_max_stack_benign", "score_batch_size", "seed", "run_mode",
+                        "load_in_4bit")
 
     def fn(out: Path, parts):
         import torch
@@ -874,8 +880,16 @@ def stage_llamaguard(cfg: Config, runner: StageRunner, force: bool = False) -> P
         mcfg = AutoConfig.from_pretrained(cfg.llamaguard_model, token=cfg.hf_token)
         if getattr(getattr(mcfg, "text_config", None), "attention_chunk_size", 0) is None:
             mcfg.text_config.attention_chunk_size = 8192
+        lg_kwargs = {}
+        if cfg.load_in_4bit and torch.cuda.is_available():
+            # 12B in bf16 is ~24 GB and would spill to CPU on a <30 GB GPU (very slow); NF4 as in the
+            # previous Llama Guard 4 project [R51][D58]
+            from transformers import BitsAndBytesConfig
+            lg_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16)
         model = LG.from_pretrained(cfg.llamaguard_model, config=mcfg, token=cfg.hf_token, dtype=torch.bfloat16,
-                                   device_map="auto").eval()
+                                   device_map="auto", **lg_kwargs).eval()
         by_id = convs.set_index("conv_id")
 
         def prompt(r):
@@ -885,7 +899,11 @@ def stage_llamaguard(cfg: Config, runner: StageRunner, force: bool = False) -> P
         probe = prompt(next(pre.itertuples(index=False)))
         enc = tok([probe], return_tensors="pt", add_special_tokens=False).to(G._device(model))
         with torch.no_grad():
-            gen = model.generate(**enc, max_new_tokens=6, do_sample=False, pad_token_id=tok.pad_token_id or tok.eos_token_id)
+            # dynamic cache: Llama Guard 4's generation config asks for a static cache, and transformers 5.x then
+            # builds masks via create_masks_for_generate, which passes `block_sequence_ids` to
+            # create_chunked_causal_mask -> TypeError. Scoring (plain forward) already uses a dynamic cache.
+            gen = model.generate(**enc, max_new_tokens=6, do_sample=False, cache_implementation="dynamic",
+                                 pad_token_id=tok.pad_token_id or tok.eos_token_id)
         text = tok.decode(gen[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
         lead = text[: len(text) - len(text.lstrip())]
         print(f"  llama guard probe output {text!r} -> lead {lead!r}")

@@ -55,8 +55,39 @@ def parse_listing(listing: str) -> list[dict]:
     return out
 
 
+PART_RE = re.compile(r"^(?P<base>.+)\.part(?P<off>\d+)$")
+
+
+def merge_split_parts(directory: Path) -> list[Path]:
+    """AIHub splits large archives into `<name>.zip.part0`, `<name>.zip.part<offset>`, ... that must be
+    concatenated in numeric order before unzipping (the AIHub guide does this with `cat` on Linux/WSL).
+    Parts are removed only after the merged file is complete. [R77][D62]"""
+    groups: dict[Path, list[tuple[int, Path]]] = {}
+    for p in Path(directory).rglob("*.part*"):
+        m = PART_RE.match(p.name)
+        if m and p.is_file():
+            groups.setdefault(p.with_name(m.group("base")), []).append((int(m.group("off")), p))
+    merged = []
+    for target, parts in groups.items():
+        parts.sort()
+        tmp = target.with_name(target.name + ".merging")
+        with open(tmp, "wb") as out:
+            for _, part in parts:
+                with open(part, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 24)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+        os.replace(tmp, target)
+        for _, part in parts:
+            part.unlink()
+        merged.append(target)
+    return merged
+
+
 def download(shell: Path, datasetkey: int, out_dir: Path, filekeys: list[int] | None = None) -> Path:
-    """Download (all files, or only `filekeys`) into out_dir, then unzip nested .zip archives.
+    """Download (all files, or only `filekeys`) into out_dir, merge split archives, then unzip .zip archives.
     Writes a _DONE marker only after everything finished, so an interrupted download is redone. [D1]"""
     from .config import _local_secret
     key = os.environ.get("AIHUB_API_KEY") or _local_secret("AIHUB_API_KEY")
@@ -75,6 +106,7 @@ def download(shell: Path, datasetkey: int, out_dir: Path, filekeys: list[int] | 
     if r.returncode != 0:
         msg = (r.stdout + r.stderr).replace(key, "***")
         raise RuntimeError(f"aihubshell failed (exit {r.returncode}):\n{msg[-2000:]}")
+    merge_split_parts(out_dir)
     for z in list(out_dir.rglob("*.zip")):
         with zipfile.ZipFile(z) as zf:
             for info in zf.infolist():                     # names inside AIHub zips are often cp949

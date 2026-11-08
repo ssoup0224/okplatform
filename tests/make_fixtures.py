@@ -200,7 +200,77 @@ def main(out: str, n: int = 160, seed: int = 0):
         talks.append({"id": f"T{i:05d}", "sentences": sents})
     with open(aih / "talksets.json", "w", encoding="utf-8") as f:
         json.dump(talks, f, ensure_ascii=False)
+    new_sources(d)
     print(f"fixtures written to {d}")
+
+
+AIHUB71833_HEADERS = ["문장", "모욕", "욕설", "외설", "장애", "인종/지역", "연령", "종교", "정치성향", "직업", "성혐오",
+                      "폭력위협/범죄조장", "정상"]
+
+
+def new_sources(d: Path, n: int = 120):
+    """WildChat-4.8M, MTID (TurnGate) and AIHub 71833 fixtures (2026-10-28) [D60][D61][D62]."""
+    def conv(lang_texts, k, i):
+        out = []
+        for t in range(k):
+            out += [{"role": "user", "content": f"{lang_texts[(t + i) % len(lang_texts)]} (대화 {i} 질문 {t})", "turn_identifier": t},
+                    {"role": "assistant", "content": f"답변 {t}입니다. 도움이 되었으면 좋겠어요.", "turn_identifier": t}]
+        return out
+    w(d, "allenai__WildChat-4.8M__None__train.jsonl",
+      [{"conversation_hash": f"wc{i:05d}", "language": "Korean" if i % 3 else "English", "turn": 1 + i % 4,
+        "toxic": i % 11 == 0, "redacted": i % 13 == 0,
+        "conversation": conv(KO_SAFE if i % 3 else EN_SAFE, 1 + i % 4, i)} for i in range(n)])
+    md = d / "mtid"
+    for split, (lo, hi) in {"train": (0, 14), "valid": (14, 17), "test": (17, 20)}.items():
+        harm, ben = [], []
+        for si in range(lo, hi):
+            for rid in range(1, 5):
+                k = 1 + (si + rid) % 4
+                c = []
+                for t in range(1, k + 1):
+                    c += [{"turn_id": t, "role": "user", "content": f"{EN_SAFE[t % len(EN_SAFE)]} step {t} seed {si} rollout {rid}",
+                           "hidden_rationale": "x"},
+                          {"turn_id": t, "role": "assistant", "content": f"reply {t}", "hidden_rationale": "x"}]
+                harm.append({"sample_index": si, "rollout_id": rid, "dataset_key": "harmful_gpt52", "target_turn": k,
+                             "target_confidence": 0.8, "target_reasoning": "x",
+                             "meta_intent": "obtain instructions to hack a server" if si % 2 else "synthesize a toxic gas",
+                             "conversation": c, "asr_classification": "D"})
+                bc = [dict(x, content=x["content"] + " (benign)") for x in c]
+                ben.append({"sample_index": si, "rollout_id": rid, "dataset_key": "benign_gpt52", "is_jailbreak_success": True,
+                            "asr_classification": "D", "conversation": bc + [
+                                {"turn_id": k + 1, "role": "user", "content": f"thanks, one more question {si}-{rid}"},
+                                {"turn_id": k + 1, "role": "assistant", "content": "sure"}],
+                            "meta_intent": "learn chemistry safety", "metadata": {"max_depth": 2, "iteration": 1}})
+        w(md, f"harmful_{split}.jsonl", harm)
+        w(md, f"benign_{split}.jsonl", ben)
+    import csv
+    ah = d / "aihub" / "71833"
+    ah.mkdir(parents=True, exist_ok=True)
+    with open(ah / "2단계_유해표현_카테고리.csv", "w", encoding="utf-8-sig", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(AIHUB71833_HEADERS)
+        for i in range(n):
+            scores = [0] * 12
+            kind = i % 6
+            if kind == 1:
+                scores[AIHUB71833_HEADERS.index("모욕") - 1] = 2            # insult only -> Controversial
+            elif kind == 2:
+                scores[AIHUB71833_HEADERS.index("종교") - 1] = 3            # group hate -> Unsafe
+            elif kind == 3:
+                scores[AIHUB71833_HEADERS.index("폭력위협/범죄조장") - 1] = 1  # threat -> Unsafe/Violent
+            elif kind == 4:
+                scores[AIHUB71833_HEADERS.index("정치성향") - 1] = 1          # politics -> Controversial
+            else:
+                scores[-1] = 1                                              # 정상
+            # harmful rows carry the real file's artefacts: span marks, #@이름# tags, stray whitespace
+            text = (KO_SAFE[i % len(KO_SAFE)] if kind in (0, 5)
+                    else f"#@이름# 이 ''유해'''한  표현 예시 문장 {kind}\n") + f" ({i})"
+            wr.writerow([text] + scores)
+    with open(ah / "1단계_유해표현_검출.csv", "w", encoding="utf-8-sig", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["content", "label"])
+        for i in range(20):
+            wr.writerow([f"1단계 문장 {i}", i % 2])
 
 
 if __name__ == "__main__":

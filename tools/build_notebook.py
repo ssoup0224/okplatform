@@ -81,7 +81,7 @@ All tunables live in `okg/config.py` [D2]. The ones you will most likely change 
 - **Previous-project data**: add your KoreanGuardrail / wildjailbreak-train-ko files through `custom_sources` [D12]. Use `seed_col` so that the 11 variants of one seed stay in one split.
 - **Commercial use**: set `allow_noncommercial=False` to drop NC, unknown or GPL sources [D3].
 - **Hardware profile**: `cfg.apply_hardware_profile()` sizes the full run to your GPU and RAM.
-  - Below 30 GB of GPU memory it switches to Qwen3Guard-Gen-4B with a 2k context and batch 1×32.
+  - Below 30 GB of GPU memory it uses a 2k context and batch 1×32, and trains Qwen3Guard-Gen-8B as 4-bit QLoRA if `bitsandbytes` is installed (otherwise it falls back to Qwen3Guard-Gen-4B). The Llama Guard 4 baseline is then also loaded in 4-bit.
   - Below 32 GB of RAM it caps each source at 20k rows and uses smaller shards [D39].
   - Every stage below ends with `after_stage()`, which frees memory.
   - Stages save their results as they go, so if RAM gets tight you can restart the kernel and re-run from the top. Finished stages are skipped.
@@ -98,7 +98,7 @@ cfg = Config(
     project_dir=".",
     # guard_model="Qwen/Qwen3Guard-Gen-4B",     # smaller alternative [R2]
     # load_in_4bit=True,                        # QLoRA if GPU memory is tight [R51]
-    # run_llamaguard_baseline=True,             # optional zero-shot Llama Guard 4 baseline [R40]
+    # run_llamaguard_baseline=False,            # skip the zero-shot Llama Guard 4 baseline (on by default) [R40]
     # allow_noncommercial=False,                # commercial-safe training set [D3]
     custom_sources=[
         # (column names below are examples — match them to your files)
@@ -126,7 +126,7 @@ P.sanity_check(cfg)
 """)
 
 md(r"""
-## (optional) AIHub 558 — Korean multi-turn ethics dialogues via aihubshell
+## (optional) AIHub 558 and 71833 — Korean data via aihubshell
 AIHub 558 is the only large, human-labelled, **native Korean multi-turn** safety set: about 132k conversations with a per-sentence `is_immoral` flag, type and intensity [R76].
 
 - **Where it runs:** access is restricted to approved accounts, so the download runs on your server with the official AIHub API shell [R77].
@@ -140,26 +140,34 @@ AIHub 558 is the only large, human-labelled, **native Korean multi-turn** safety
   - only CENSURE/ABUSE with intensity < 2 → Controversial
   - otherwise → Unsafe, with the most severe type as the category
   - each conversation ends at its first Unsafe turn
+- **AIHub 71833** (LLM 학습용 데이터 내 유해표현 검출, 2025) [R86][D62]: 200k Korean sentences (half 정상, half harmful news comments), each scored 0–3 on 11 harm categories. Request access to dataset 71833 too; the cell downloads both of its CSVs (split archives are merged first). Only the stage-2 (category) file is used:
+  - violent threat / crime incitement ≥ 1 → Unsafe (Violent)
+  - group hate (장애, 인종/지역, 연령, 종교, 직업, 성혐오) or 외설 ≥ `aihub71833_unsafe_min_score` (2) → Unsafe
+  - lower scores, 모욕 or 욕설 → Controversial; 정치성향 only → Controversial
+  - only the harmful half is used: the 정상 half is formal text from other corpora, a style shortcut (`aihub71833_keep_safe`)
+  - annotation marks around the harmful words and `#@이름#` tags, which appear only in harmful rows, are removed
+  - it is a comment corpus (counts toward `comment_corpora_ko_share`) and also trains the hate classifier (S06h)
 """)
 code(r"""
 from okg import aihub
 from okg.utils import run_optional
 
-def get_aihub():
+def get_aihub(datasetkey, filekeys, labels_only):
     shell = aihub.ensure_shell(cfg.cache_dir)
-    listing = aihub.list_files(shell, cfg.aihub_datasetkey)
+    listing = aihub.list_files(shell, datasetkey)
     print(listing[:3000])
     files = aihub.parse_listing(listing)
-    keys = cfg.aihub_filekeys or [f["filekey"] for f in files if f["is_label"]]
-    print("selected filekeys:", keys or "(none recognised -> whole dataset)")
-    aihub.download(shell, cfg.aihub_datasetkey, cfg.aihub_dir / str(cfg.aihub_datasetkey), keys or None)
-    print("AIHub 558 ready:", cfg.aihub_dir / str(cfg.aihub_datasetkey))
+    keys = filekeys or ([f["filekey"] for f in files if f["is_label"]] if labels_only else [])
+    print(f"AIHub {datasetkey} selected filekeys:", keys or "(all files)")
+    aihub.download(shell, datasetkey, cfg.aihub_dir / str(datasetkey), keys or None)
+    print(f"AIHub {datasetkey} ready:", cfg.aihub_dir / str(datasetkey))
 
 if os.environ.get("AIHUB_API_KEY"):
-    # a failed download is reported, not fatal: aihub_558 then shows as FAILED in the S01 manifest
-    run_optional("AIHub 558 download", get_aihub)
+    # a failed download is reported, not fatal: the source then shows as FAILED in the S01 manifest
+    run_optional("AIHub 558 download", lambda: get_aihub(cfg.aihub_datasetkey, cfg.aihub_filekeys, True))
+    run_optional("AIHub 71833 download", lambda: get_aihub(cfg.aihub71833_datasetkey, cfg.aihub71833_filekeys, False))
 else:
-    print("AIHUB_API_KEY not set -> aihub_558 is skipped (it will show as FAILED in the S01 manifest)")
+    print("AIHUB_API_KEY not set -> aihub_558 and aihub_71833 are skipped (they will show as FAILED in the S01 manifest)")
 """)
 
 md(r"""
@@ -168,10 +176,10 @@ Datasets come from **awesome-korean-safety** [R27] plus English multi-turn and b
 
 | Role | Sources |
 |---|---|
-| train (KO) | WildGuardMix-KO [R24], K-MHaS [R27], K-HATERS [R29], KOLD [R28], KOTOX [R25], prompt-injections-KR [R27], SQuARe questions [R30] |
-| train (EN) | WildGuardMix (EN side), Aegis 2.0 [R34], OR-Bench-80k hard negatives [R32], **SafeMTData** [R21], **XGuard-Train** [R22] multi-turn |
-| benign history | UltraChat [R31], KoAlpaca [R42], SQuARe acceptable responses [R30] |
-| eval only | WildGuardMix-KO test, KOTOX test (easy/normal/hard), CSRT [R26], red-teaming-KR, RaccoonBench-KR, APEACH, SQuARe OOD, OR-Bench hard/toxic, XSTest [R33], UltraChat test, **MHJ** [R23], **DKTC** |
+| train (KO) | WildGuardMix-KO [R24], K-MHaS [R27], K-HATERS [R29], KOLD [R28], KOTOX [R25], prompt-injections-KR [R27], SQuARe questions [R30], **AIHub 71833** [R86] |
+| train (EN) | WildGuardMix (EN side), Aegis 2.0 [R34], OR-Bench-80k hard negatives [R32], **SafeMTData** [R21], **XGuard-Train** [R22] multi-turn, **MTID** [R85] (turn-level labels) |
+| benign history | UltraChat [R31], KoAlpaca [R42], SQuARe acceptable responses [R30], koVast [R71], **WildChat Korean** [R84] |
+| eval only | WildGuardMix-KO test, KOTOX test (easy/normal/hard), CSRT [R26], red-teaming-KR, RaccoonBench-KR, APEACH, SQuARe OOD, OR-Bench hard/toxic, XSTest [R33], UltraChat test, **MHJ** [R23], **DKTC**, **MTID test** [R85] |
 
 Label semantics [D4]: rude-but-not-hateful Korean comments → **Controversial**, not Unsafe, so the guard does not learn "rude = unsafe". Native multi-turn attacks label only the final turn; the earlier turns are `Unknown` [D6]. See `DATASETS.md` for every source's columns, mapping and licence.
 
@@ -290,7 +298,7 @@ Fixes for the previous project's multi-turn *parse collapse*:
 
 Settings: LoRA r=16, α=32, all linear layers [R6]; lr 1e-4, cosine schedule; gradient checkpointing [R50]. These are starting points to validate. A single mixed EN+KO stage replaces the old sequential stages with replay.
 
-Saving: the adapter is committed only after training ends. With `sft_resume_from_checkpoint=True`, Trainer checkpoints are kept and resumed [R7]. The default is a fresh re-run, per your rule [D1].
+Saving: the adapter is committed only after training ends. Trainer checkpoints are saved every 100 steps and resumed from the newest complete one (`sft_resume_from_checkpoint=True`, default since D57), so SFT can span several 10 h sessions [R7][D57]. Do not change the config or code between sessions.
 """)
 code(r"""
 P.stage_sft(cfg, runner)

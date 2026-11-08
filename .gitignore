@@ -24,3 +24,6 @@ artifacts/
 cache/
 releases/
 feedback/
+
+# Raw AIHub 71833 download (licensed, not redistributable)
+/유해표현 검출 AI모델 학습용 데이터/

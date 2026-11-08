@@ -58,7 +58,7 @@ class Config:
     allow_noncommercial: bool = True    # False -> drop NC / research-only sources [D3]
     rows_per_source_cap: int = 20000    # cap per raw source (full mode)
     comment_corpora_ko_share: float = 0.15   # cap hate-comment corpora in KO train [D4]
-    xguard_max_conversations: int = 8000
+    xguard_max_conversations: int = 31000    # all ~30.7k X-Teaming dialogues (was 8000) [D59]
     ultrachat_max_conversations: int = 12000
     custom_sources: list = field(default_factory=list)   # previous-project CSVs etc. (see okg.data_sources.load_custom)
 
@@ -88,7 +88,7 @@ class Config:
     max_prefixes_per_conv: int = 3      # cap on training prefixes from one conversation [D5]
     train_on_ambiguous_prefixes: bool = False   # pre-attack turns of native attacks [D6]
     target_unsafe_ratio: float = 0.5    # 1:1 Safe:Unsafe [R2]
-    max_train_examples: int = 200000    # was 60k of ~217k available; balanced selection usually yields fewer [D53]
+    max_train_examples: int = 100000    # 200k x 2 epochs took ~60 h; cut so the run fits 10 h sessions [D57] (D53 had 200k)
     replay_share: float = 0.10          # share of SFT examples labelled by the BASE model (forgetting guard) [D52]
     replay_langs: tuple = ("en",)       # languages whose zero-shot behaviour the replay preserves
     lora_r: int = 16                    # [R6] starting point, validate
@@ -96,7 +96,7 @@ class Config:
     lora_dropout: float = 0.05
     lora_target_modules: str = "all-linear"   # PEFT shortcut for all linear layers [R6]
     learning_rate: float = 1e-4
-    num_train_epochs: float = 2.0       # was 1.0 [D53]
+    num_train_epochs: float = 1.0       # D53 had 2.0; cut to fit 10 h sessions [D57]
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 16     # effective batch 32
     warmup_ratio: float = 0.03
@@ -104,8 +104,9 @@ class Config:
     bf16: bool = True
     gradient_checkpointing: bool = True       # [R50]
     load_in_4bit: bool = False                # QLoRA option [R51] (needs bitsandbytes + CUDA)
-    save_steps: int = 500
-    sft_resume_from_checkpoint: bool = False  # user rule: an interrupted stage is re-run [D1]
+    save_steps: int = 100                     # checkpoint often: at most ~100 steps lost when a session ends [D57]
+    eval_steps: int = 500                     # validation loss interval, decoupled from checkpointing [D57]
+    sft_resume_from_checkpoint: bool = True   # SFT spans several 10 h sessions; resume Trainer checkpoints [D57]
     max_steps: int = -1
 
     # ---------------- scoring ----------------
@@ -144,7 +145,7 @@ class Config:
     hate_classifier: bool = True
     hate_backend: str = "transformer"   # "transformer" (full) | "ngram" (offline smoke / fallback)
     hate_model: str = "beomi/KcELECTRA-base-v2022"   # alternative: "klue/roberta-base" [R80][R81]
-    hate_train_sources: tuple = ("k_haters", "kmhas", "beep")
+    hate_train_sources: tuple = ("k_haters", "kmhas", "beep", "aihub_71833")   # + AIHub 71833 [D62]
     hate_negative_sources: tuple = ("square_q", "aihub_558", "synth_benign_native", "kosbi", "curse")
     hate_max_len: int = 128
     hate_epochs: float = 2.0
@@ -167,6 +168,17 @@ class Config:
     aihub_max_talksets: int = 120000            # AIHub 558 talksets used (of ~132k); was 30k [D50]
     aihub_datasetkey: int = 558
     aihub_filekeys: list = field(default_factory=list)   # empty -> auto-pick label files from the listing
+    # AIHub 71833 (LLM 학습용 데이터 내 유해표현 검출): 200k KO sentences (100k 정상 + 100k harmful news comments), 11 harm categories scored 0-3 [D62]
+    aihub71833_datasetkey: int = 71833
+    aihub71833_filekeys: list = field(default_factory=list)  # empty -> every file (two CSVs)
+    aihub71833_max_rows: int = 50000            # harmful sentences used (of ~92k labelled; random sample)
+    aihub71833_unsafe_min_score: int = 2        # group-hate / obscenity score >= this -> Unsafe, below -> Controversial
+    aihub71833_keep_safe: bool = False          # its 정상 half is formal text from other corpora (style shortcut)
+    # WildChat-4.8M (non-toxic, ODC-BY): real users' Korean multi-turn chats as benign history [D60]
+    wildchat_ko_max_conversations: int = 12000
+    wildchat_min_user_turns: int = 2
+    # MTID (TurnGate): multi-turn attacks labelled at the turn where harm becomes possible + benign twins [D61]
+    mtid_rollouts_per_sample: int = 5           # of 20 near-duplicate rollouts per seed
     screen_benign: bool = True                  # zero-shot guard screen of benign pools (S02b) [D40]
     screen_threshold: float = 0.5               # drop a benign conversation if any user turn P(Unsafe)+P(Contro) > this
     min_free_ram_gb: float = 4.0                # warn before a stage if less RAM is available [D39]
@@ -225,6 +237,7 @@ class Config:
             self.gradient_accumulation_steps = 1
             self.max_steps = 20
             self.save_steps = 10
+            self.eval_steps = 10
             self.bf16 = False
             self.gradient_checkpointing = False
             self.score_batch_size = 8
@@ -241,6 +254,9 @@ class Config:
             self.feedback_test_days = 7
             self.memory_encoder = "hashing"
             self.kovast_max_conversations = 60
+            self.wildchat_ko_max_conversations = 60
+            self.mtid_rollouts_per_sample = 2
+            self.aihub71833_max_rows = 120
             self.aihub_max_talksets = 60
             self.screen_threshold = 0.99            # tiny random model: exercise the code, drop nothing
             self.gate_min_n = 5
@@ -302,6 +318,7 @@ class Config:
             self.rows_per_source_cap = min(self.rows_per_source_cap, 20000)
             self.shard_size = min(self.shard_size, 500)
             self.aihub_max_talksets = min(self.aihub_max_talksets, 60000)
+            self.aihub71833_max_rows = min(self.aihub71833_max_rows, 20000)
             prof["ram_note"] = "<32 GB RAM: per-source cap 20k, shard 500, AIHub 60k talksets"
         if verbose:
             print(prof)

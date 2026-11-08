@@ -251,6 +251,22 @@ def test_conversation_table_latency():
     assert m["recall"] == 1.0 and m["fpr"] == 0.0
 
 
+def test_vectorised_bootstrap_matches_sklearn_on_resample():
+    """Weighted (count-matrix) bootstrap metrics == point_metrics on the explicitly resampled table."""
+    rng = np.random.default_rng(0)
+    for _ in range(100):
+        n = int(rng.integers(1, 30))
+        y, s, p = rng.integers(0, 2, n), np.round(rng.random(n), 1), rng.integers(0, 2, n)   # rounding -> ties
+        idx = rng.integers(0, n, n)
+        got = ev._weighted_boot_metrics(np.bincount(idx, minlength=n)[None], y, s, p)
+        ref = ev.point_metrics(pd.DataFrame({"y": y[idx], "score": s[idx], "pred": p[idx], "latency": np.nan}), 0.9)
+        for k in ("recall", "fpr", "roc_auc", "pr_auc"):
+            assert (np.isnan(got[k][0]) and np.isnan(ref[k])) or got[k][0] == pytest.approx(ref[k]), k
+    ci = ev.bootstrap_ci(pd.DataFrame({"y": [0, 1] * 50, "score": np.linspace(0, 1, 100), "pred": [0, 1] * 50}), 200, 0)
+    assert ci["recall_ci_lo"] == ci["recall_ci_hi"] == 1.0 and ci["fpr_ci_hi"] == 0.0
+    assert 0 <= ci["roc_auc_ci_lo"] <= ci["roc_auc_ci_hi"] <= 1
+
+
 def test_interrupted_rerun_blocks_downstream(tmp_path):
     r = StageRunner(tmp_path / "art", verbose=False)
     r.run("A", {"v": 1}, lambda o, p: {})

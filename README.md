@@ -15,13 +15,14 @@ This is a multi-turn **Korean + English** LLM guardrail: a LoRA-fine-tuned **Qwe
 | English regression after tuning | flip analysis (OR-Bench-80k label-convention conflict); 10% base-model replay in SFT | `okg/analysis.py`, `okg/guard.py` [D52] |
 | Korean hate speech 22–57% | KcELECTRA hate classifier (S06h) as features and OR-rule | `okg/hate.py` [D54] |
 | Stack not clearly better than the guard | `decision_system="auto"`: stack only if it clearly wins on external AND human multi-turn sets | `okg/evaluate.py` [D46] |
-| Training under-used | ≤200k examples, 2 epochs, 8B as 4-bit QLoRA under 30 GB | `okg/config.py` [D53] |
+| Training under-used | ≤100k examples, 1 epoch (D53 had 200k × 2, ~60 h; cut for 10 h sessions [D57]), 8B as 4-bit QLoRA under 30 GB | `okg/config.py` [D53][D57] |
 | One threshold, 1.12% test FPR on a 1% budget | per-language thresholds with a Clopper–Pearson 95% margin; graded actions | `okg/stacker.py`, `okg/policy.py` [D47][D48] |
 | No monitoring | block rate by language/hour, PSI drift, review backlog, reviewer κ, alerts | `okg/monitoring.py` [D56] |
 | Weak promotion gate | named checks MHJ / DKTC / AIHub 558 / shadow traffic; red-team pass vs CURRENT; `tools/redteam_release.py` for cron | `okg/release.py`, `okg/redteam.py` [D55] |
-| Missing comparisons | Llama Guard 4 baseline on by default (fixed verdict-token detection, config fix); KorSET needs gated access (below) | S09 [D25] |
+| Missing comparisons | Llama Guard 4 baseline on by default (fixed verdict-token detection, config fix; 4-bit on <30 GB GPUs [D58]); KorSET needs gated access (below) | S09 [D25][D58] |
+| More multi-turn and Korean data | XGuard-Train in full (30.7k); WildChat Korean real-user chats as benign history; MTID multi-turn attacks with turn-level labels (+ `mtid_test`); AIHub 71833 Korean harmful-expression sentences (also trains the hate classifier) | `okg/data_sources.py` [D59–D62] |
 
-**Before the next full run, on your side:** accept the terms of `datumo/KorSET` and `meta-llama/Llama-Guard-4-12B` on Hugging Face with the account whose token is in `local_secrets.py` (both are gated; KorSET failed with `DatasetNotFoundError` in the last run). Install `bitsandbytes` if the GPU has < 30 GB, so the 8B model trains in 4-bit.
+**Before the next full run, on your side:** accept the terms of `datumo/KorSET` and `meta-llama/Llama-Guard-4-12B` on Hugging Face with the account whose token is in `local_secrets.py` (both are gated; KorSET failed with `DatasetNotFoundError` in the last run). Request AIHub access to dataset 71833 as well (the AIHub cell downloads it next to 558). The first S01 also downloads WildChat-4.8M shard by shard (~15 GB transferred once, a few MB kept). Install `bitsandbytes` if the GPU has < 30 GB, so the 8B model trains in 4-bit.
 
 Offline results on the existing full-run artifacts: `python tools/analyze_run.py --mode full` → `artifacts/full/analysis/REPORT.md`.
 
@@ -41,7 +42,7 @@ jupyter notebook okchat_guardrail.ipynb
 - Long stages save each finished part: sources, synthesis shards, translation shards, scoring shards. If a run stops, re-running the cell skips the finished parts and re-runs the interrupted one.
 - When a stage re-runs, its old marker is removed first. Downstream stages therefore refuse to run until the stage finishes again.
 - A changed config value, changed stage code, or changed upstream result invalidates the stage automatically.
-- SFT checkpoints are not resumed by default, per your rule that interrupted work is re-run. Set `sft_resume_from_checkpoint=True` to resume Trainer checkpoints instead.
+- SFT is the one exception to "an interrupted stage is re-run": `sft_resume_from_checkpoint=True` (default since D57) keeps Trainer checkpoints in `S06_sft.__parts__/checkpoints` every `save_steps=100` steps and resumes from the newest complete one, so training can span several 10 h sessions. A checkpoint cut off mid-write is discarded. Do not change the config or `okg/` code between sessions: the stage hash includes both, and a changed hash starts the stage over.
 
 ## Data (see DATASETS.md)
 - **48 sources are enabled by default:**
@@ -56,7 +57,7 @@ jupyter notebook okchat_guardrail.ipynb
 - Datasets are filtered and sampled on disk before they are loaded, and one source is processed at a time.
 - `after_stage()` runs after every stage: gc, CUDA cache, `malloc_trim`.
 - `expandable_segments` is set before torch is imported.
-- `cfg.apply_hardware_profile()` switches to Qwen3Guard-Gen-4B and a 2k context on GPUs under 30 GB.
+- `cfg.apply_hardware_profile()` uses a 2k context on GPUs under 30 GB and trains the 8B model as 4-bit QLoRA (Qwen3Guard-Gen-4B only if `bitsandbytes` is missing). The Llama Guard 4 baseline is loaded in 4-bit there too [D58].
 - If memory runs low, restart the kernel and re-run: finished stages are skipped.
 
 ## Continual improvement (feedback loop)
@@ -106,7 +107,7 @@ tools/redteam_release.py scheduled red-team pass (cron)
 |---|---|
 | Translation | about 4 h (1,000 dialogues) |
 | Attack generation (S03b) | about 3–5 h (≈4.8k Korean dialogues incl. twins, 7B model) |
-| SFT | ≈ 6–10 h per 60k examples per epoch: 200k × 2 epochs is roughly 40–65 h (lower `max_train_examples` / `num_train_epochs` to trade off) |
+| SFT | ≈ 6–10 h per 60k examples per epoch: the default 100k × 1 epoch is roughly 10–17 h, resumable across sessions (200k × 2 epochs would be 40–65 h) |
 | Hate classifier (S06h) | under 30 min |
 | Scoring | about 3 h (base + tuned) + response scoring ≈ 1 h |
 | Llama Guard 4 baseline | about 2–4 h (test + 4k benign stack conversations) |

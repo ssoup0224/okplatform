@@ -17,26 +17,47 @@ from sklearn.metrics import (average_precision_score, f1_score, matthews_corrcoe
 from statsmodels.stats.contingency_tables import mcnemar
 
 
+_CT_COLS = ["conv_id", "source", "family", "lang", "y", "score", "pred", "first_flag_turn", "t_attack", "latency"]
+
+
 def conversation_table(prefix_scores: pd.DataFrame, score_col: str, thr) -> pd.DataFrame:
     """prefix_scores needs conv_id, source, family, lang, turn_idx, t_attack, label3, latency_valid.
-    `thr` is a float or a per-language dict with a '_global' fallback [D47]."""
+    `thr` is a float or a per-language dict with a '_global' fallback [D47].
+    Vectorised (one groupby pass instead of a Python loop per conversation); conversation metadata
+    (source, family, lang, t_attack, latency_valid) is taken from its earliest turn."""
     from .stacker import threshold_for
-    rows = []
-    for cid, g in prefix_scores.sort_values("turn_idx").groupby("conv_id", sort=False):
-        labels = g["label3"].tolist()
-        has_unsafe = any(l == "Unsafe" for l in labels)
-        known_safe = all(l == "Safe" for l in labels)
-        if not has_unsafe and not known_safe:
-            continue            # Controversial-only / unknown conversations: excluded from binary metrics
-        s = g[score_col].to_numpy(float)
-        flagged = np.nonzero(s > threshold_for(thr, g["lang"].iloc[0]))[0]
-        t_attack = int(g["t_attack"].iloc[0])
-        first = int(g["turn_idx"].to_numpy()[flagged[0]]) if len(flagged) else -1
-        rows.append({"conv_id": cid, "source": g["source"].iloc[0], "family": g["family"].iloc[0],
-                     "lang": g["lang"].iloc[0], "y": int(has_unsafe), "score": float(s.max()),
-                     "pred": int(len(flagged) > 0), "first_flag_turn": first, "t_attack": t_attack,
-                     "latency": (first - t_attack) if (has_unsafe and first >= 0 and bool(g["latency_valid"].iloc[0])) else np.nan})
-    return pd.DataFrame(rows)
+    if len(prefix_scores) == 0:
+        return pd.DataFrame(columns=_CT_COLS)
+    d = prefix_scores.sort_values("turn_idx")
+    s = d[score_col].to_numpy(float)
+    lab = d["label3"]
+    work = pd.DataFrame({"conv_id": d["conv_id"].to_numpy(), "unsafe": (lab == "Unsafe").to_numpy(),
+                         "safe": (lab == "Safe").to_numpy(), "s": s, "s_nan": np.isnan(s),
+                         "turn_idx": d["turn_idx"].to_numpy()})
+    g = work.groupby("conv_id", sort=False)
+    first_row = (d.loc[d["conv_id"].notna(), ["conv_id", "source", "family", "lang", "t_attack", "latency_valid"]]
+                 .drop_duplicates("conv_id", keep="first").set_index("conv_id"))   # earliest turn, NaNs kept as-is
+    # threshold per conversation = threshold of its first turn's language
+    lang_thr = {l: threshold_for(thr, l) for l in pd.unique(first_row["lang"])}
+    conv_thr = first_row["lang"].map(lang_thr).astype(float)
+    flagged = s > work["conv_id"].map(conv_thr).to_numpy(float)
+    first_flag = (pd.Series(np.where(flagged, work["turn_idx"].to_numpy(), np.nan))
+                  .groupby(work["conv_id"].to_numpy(), sort=False).min())
+    agg = pd.DataFrame({"has_unsafe": g["unsafe"].any(), "known_safe": g["safe"].all(),
+                        "score": g["s"].max(), "any_nan": g["s_nan"].any()})
+    agg["score"] = agg["score"].where(~agg["any_nan"], np.nan)           # numpy max semantics: NaN propagates
+    keep = agg["has_unsafe"] | agg["known_safe"]    # Controversial-only / unknown: excluded from binary metrics
+    agg, first_row = agg[keep], first_row[keep]
+    first = first_flag.reindex(agg.index).fillna(-1).astype(int)
+    t_attack = first_row["t_attack"].astype(int)
+    lat_ok = agg["has_unsafe"] & (first >= 0) & first_row["latency_valid"].astype(bool)
+    out = pd.DataFrame({"conv_id": agg.index, "source": first_row["source"].to_numpy(),
+                        "family": first_row["family"].to_numpy(), "lang": first_row["lang"].to_numpy(),
+                        "y": agg["has_unsafe"].astype(int).to_numpy(), "score": agg["score"].to_numpy(float),
+                        "pred": (first >= 0).astype(int).to_numpy(), "first_flag_turn": first.to_numpy(),
+                        "t_attack": t_attack.to_numpy(),
+                        "latency": np.where(lat_ok, (first - t_attack).to_numpy(float), np.nan)})
+    return out.reset_index(drop=True)
 
 
 def _safe(fn, *a, **k):
@@ -69,19 +90,62 @@ def point_metrics(ct: pd.DataFrame, recall_target: float) -> dict:
     return out
 
 
-def bootstrap_ci(ct: pd.DataFrame, n: int, seed: int, keys=("recall", "fpr", "roc_auc", "pr_auc")) -> dict:
-    """Percentile CI; each resample draws conversations with replacement [R18]."""
+_BOOT_KEYS = ("recall", "fpr", "roc_auc", "pr_auc")
+_BOOT_CELLS = 4_000_000          # resamples x conversations held in memory at once (~32 MB per float array)
+
+
+def _weighted_boot_metrics(w: np.ndarray, y: np.ndarray, s: np.ndarray, p: np.ndarray) -> dict:
+    """Metrics for a batch of bootstrap resamples given as integer weights w (B x n): resampling with
+    replacement == counting each conversation w times, so these equal sklearn on the resampled table
+    (ROC-AUC with ties counted 1/2, average precision as in average_precision_score)."""
+    yb = y.astype(bool)
+    P = w[:, yb].sum(1).astype(float)
+    N = w[:, ~yb].sum(1).astype(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        recall = np.where(P > 0, (w[:, yb & (p == 1)]).sum(1) / P, np.nan)
+        fpr = np.where(N > 0, (w[:, ~yb & (p == 1)]).sum(1) / N, np.nan)
+        two = (P > 0) & (N > 0)
+        if np.isnan(s).any():                       # sklearn raises on NaN scores -> point_metrics gives NaN
+            auc = ap = np.full(len(w), np.nan)
+        else:
+            order = np.argsort(-s, kind="mergesort")
+            ss = s[order]
+            starts = np.r_[0, np.nonzero(np.diff(ss))[0] + 1]           # one level per distinct score, descending
+            ws = w[:, order]
+            ys = yb[order]
+            pos_l = np.add.reduceat(ws * ys, starts, axis=1).astype(float)
+            neg_l = np.add.reduceat(ws * ~ys, starts, axis=1).astype(float)
+            neg_below = N[:, None] - np.cumsum(neg_l, axis=1)
+            auc = np.where(two, (pos_l * (neg_below + 0.5 * neg_l)).sum(1) / (P * N), np.nan)
+            tp, fp = np.cumsum(pos_l, axis=1), np.cumsum(neg_l, axis=1)
+            prec = np.where(tp + fp > 0, tp / np.where(tp + fp > 0, tp + fp, 1.0), 0.0)
+            ap = np.where(two, (pos_l * prec).sum(1) / P, np.nan)
+    return {"recall": recall, "fpr": fpr, "roc_auc": auc, "pr_auc": ap}
+
+
+def bootstrap_ci(ct: pd.DataFrame, n: int, seed: int, keys=_BOOT_KEYS) -> dict:
+    """Percentile CI; each resample draws conversations with replacement [R18]. Vectorised: resamples
+    are processed in batches as count matrices instead of one sklearn round-trip per resample."""
     rng = np.random.default_rng(seed)
+    m = len(ct)
     vals = {k: [] for k in keys}
-    idx = np.arange(len(ct))
-    for _ in range(n):
-        b = ct.iloc[rng.choice(idx, len(idx), replace=True)]
-        m = point_metrics(b, 0.9)
-        for k in keys:
-            vals[k].append(m[k])
+    if m and n:
+        y = ct["y"].to_numpy(int)
+        s = ct["score"].to_numpy(float)
+        p = ct["pred"].to_numpy(int)
+        batch = max(1, min(n, _BOOT_CELLS // m))
+        done = 0
+        while done < n:
+            b = min(batch, n - done)
+            idx = rng.integers(0, m, size=(b, m))
+            w = np.bincount((idx + np.arange(b)[:, None] * m).ravel(), minlength=b * m).reshape(b, m)
+            res = _weighted_boot_metrics(w, y, s, p)
+            for k in keys:
+                vals[k].append(res[k])
+            done += b
     out = {}
-    for k, v in vals.items():
-        v = np.array(v, float)
+    for k in keys:
+        v = np.concatenate(vals[k]) if vals[k] else np.array([], float)
         v = v[~np.isnan(v)]
         out[f"{k}_ci_lo"] = float(np.percentile(v, 2.5)) if len(v) else np.nan
         out[f"{k}_ci_hi"] = float(np.percentile(v, 97.5)) if len(v) else np.nan
@@ -90,8 +154,10 @@ def bootstrap_ci(ct: pd.DataFrame, n: int, seed: int, keys=("recall", "fpr", "ro
 
 def report(systems: dict[str, pd.DataFrame], cfg, group_cols=("source",)) -> pd.DataFrame:
     """systems: name -> conversation table. Returns long table of metrics per system x group."""
+    import time
     rows = []
-    for name, ct in systems.items():
+    for i, (name, ct) in enumerate(systems.items(), 1):
+        t0 = time.time()
         groups = [("ALL", ct)]
         for gc in group_cols:
             groups += [(f"{gc}={v}", g) for v, g in ct.groupby(gc)]
@@ -99,6 +165,8 @@ def report(systems: dict[str, pd.DataFrame], cfg, group_cols=("source",)) -> pd.
             m = point_metrics(g, cfg.recall_target)
             m.update(bootstrap_ci(g, cfg.bootstrap_n, cfg.seed))
             rows.append({"system": name, "group": gname, **m})
+        print(f"  report[{'/'.join(group_cols)}] {i}/{len(systems)} {name}: {len(groups)} groups, "
+              f"{len(ct)} convs, {time.time() - t0:.1f}s", flush=True)
     return pd.DataFrame(rows)
 
 

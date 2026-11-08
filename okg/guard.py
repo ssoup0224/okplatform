@@ -414,6 +414,23 @@ def build_sft_records(sel: pd.DataFrame, convs: pd.DataFrame, tok, cfg, prompts_
     return recs
 
 
+def latest_complete_checkpoint(ckpt_dir) -> str | None:
+    """Newest Trainer checkpoint that finished writing. A session killed mid-save leaves a partial
+    checkpoint-N; Trainer writes trainer_state.json and then rng_state*.pth last, so a folder without
+    both is incomplete and is removed rather than resumed from. [D57]"""
+    import shutil
+    good = []
+    for p in Path(ckpt_dir).glob("checkpoint-*"):
+        if not p.is_dir() or not p.name.split("-")[-1].isdigit():
+            continue
+        if (p / "trainer_state.json").exists() and any(p.glob("rng_state*.pth")):
+            good.append(p)
+        else:
+            print(f"[resume] discarding incomplete {p.name}")
+            shutil.rmtree(p, ignore_errors=True)
+    return str(max(good, key=lambda p: int(p.name.split("-")[-1]))) if good else None
+
+
 def train_lora(cfg, model, tok, train_recs: list[dict], val_recs: list[dict], ckpt_dir: Path, resume: bool):
     """LoRA SFT with TRL. prompt/completion columns -> completion-only loss [R4]; LoRA on all
     linear layers [R6]; Trainer checkpointing/resume [R7]; seeding [R8]."""
@@ -442,13 +459,15 @@ def train_lora(cfg, model, tok, train_recs: list[dict], val_recs: list[dict], ck
         warmup_steps=cfg.warmup_ratio, lr_scheduler_type=cfg.lr_scheduler_type,
         bf16=bool(cfg.bf16 and cuda), gradient_checkpointing=cfg.gradient_checkpointing,
         logging_steps=10, save_strategy="steps", save_steps=cfg.save_steps, save_total_limit=2,   # [R7]
-        eval_strategy="steps" if val_ds is not None else "no", eval_steps=cfg.save_steps,
+        eval_strategy="steps" if val_ds is not None else "no", eval_steps=cfg.eval_steps,
         report_to="none", seed=cfg.seed, use_cpu=not cuda, dataloader_num_workers=0,
     )
     trainer = SFTTrainer(model=model, args=args, train_dataset=train_ds, eval_dataset=val_ds,
                          processing_class=tok, peft_config=peft_cfg)
-    has_ckpt = resume and any(Path(ckpt_dir).glob("checkpoint-*"))
-    result = trainer.train(resume_from_checkpoint=True if has_ckpt else None)            # [R7]
+    ckpt = latest_complete_checkpoint(ckpt_dir) if resume else None
+    if ckpt:
+        print(f"[resume] SFT from {ckpt}")
+    result = trainer.train(resume_from_checkpoint=ckpt)                                  # [R7][D57]
     metrics = dict(result.metrics)
     if val_ds is not None:
         metrics.update({f"final_{k}": v for k, v in trainer.evaluate().items()})
