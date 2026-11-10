@@ -1,0 +1,18 @@
+# Serving only: the training-only packages (trl, datasets, shap, statsmodels, notebook) are left out.
+# torch is installed separately for the server's CUDA (see deploy/Dockerfile).
+# Versions match requirements.txt; lightgbm and scikit-learn must match the training server exactly,
+# because fold_ensemble.pkl is a pickle of their objects.
+transformers==5.17.0
+peft==0.21.0
+accelerate==1.15.0
+tokenizers==0.23.2
+safetensors==0.8.0
+lightgbm==4.7.0
+scikit-learn==1.8.0
+pandas==3.0.2
+pyarrow==25.0.1
+numpy==2.4.4
+scipy==1.17.1
+bitsandbytes>=0.45        # 8B in 4-bit NF4, as the release was calibrated
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30

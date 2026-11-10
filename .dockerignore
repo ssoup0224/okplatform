@@ -1,0 +1,7 @@
+# Allow-list: only the serving code goes into the image. Releases, caches, data, feedback logs,
+# notebooks and local_secrets.py (HF / AIHub tokens) never do.
+*
+!okg/
+!deploy/
+**/__pycache__
+**/*.pyc
