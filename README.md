@@ -324,6 +324,7 @@ tools/build_notebook.py  regenerates the notebook (the checked-in notebook also 
 tools/analyze_run.py     offline analyses of a finished run (no GPU)
 tools/bench_latency.py   per-turn latency on the target GPU
 tools/redteam_release.py scheduled red-team pass (cron)
+tools/demo_server.py     live chat demo page of a release (tools/demo/; stdlib only; see the docstring)
 ```
 
 ## Tests

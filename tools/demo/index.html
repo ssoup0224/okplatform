@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>okchat 가드레일 데모</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --panel: #ffffff; --ink: #141a24; --muted: #5d6878; --line: #e2e7ee;
+    --accent: #2f5bea; --accent-soft: #e8eefe;
+    --allow: #1f9d55; --allow-soft: #e6f6ed;
+    --careful: #2f7fd1; --careful-soft: #e7f1fb;
+    --safe: #d9822b; --safe-soft: #fdf1e4;
+    --block: #d93636; --block-soft: #fde9e9;
+    --user: #2f5bea; --user-ink: #ffffff; --bot: #eef1f5;
+    --radius: 14px;
+    --font: "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 17px/1.5 var(--font); }
+  button { font: inherit; cursor: pointer; }
+  .app { height: 100vh; display: grid; grid-template-rows: 64px 1fr; }
+
+  header { display: flex; align-items: center; gap: 16px; padding: 0 24px; background: var(--panel);
+           border-bottom: 1px solid var(--line); }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 21px; letter-spacing: -.02em; }
+  .logo .mark { width: 30px; height: 30px; border-radius: 8px; background: var(--accent); display: grid; place-items: center; }
+  .logo .mark svg { width: 18px; height: 18px; }
+  .sub { color: var(--muted); font-size: 15px; }
+  .spacer { flex: 1; }
+  .pill { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--bg); color: var(--muted);
+          border: 1px solid var(--line); white-space: nowrap; }
+  .pill.mock { background: var(--block); color: #fff; border-color: var(--block); font-weight: 700; }
+  .toggle { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; user-select: none; }
+  .switch { width: 50px; height: 28px; border-radius: 999px; background: #c5ccd6; position: relative; border: 0; padding: 0; transition: background .2s; }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.2); }
+  .switch.on { background: var(--allow); }
+  .switch.on::after { transform: translateX(22px); }
+
+  main { display: grid; grid-template-columns: 290px minmax(0, 1fr) 560px; gap: 16px; padding: 16px; min-height: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); min-height: 0; }
+
+  /* scenarios */
+  .scen { display: flex; flex-direction: column; padding: 16px; gap: 8px; overflow: auto; }
+  .scen h3, .guard h3 { margin: 0 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .sbtn { text-align: left; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  .sbtn:hover { border-color: var(--accent); }
+  .sbtn.active { background: var(--accent-soft); border-color: var(--accent); font-weight: 700; }
+  .ctrl { display: grid; gap: 8px; margin-top: 8px; }
+  .btn { padding: 11px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); font-weight: 600; }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .caption { font-size: 14px; color: var(--muted); padding: 10px 12px; background: var(--bg); border-radius: 10px; min-height: 44px; }
+  .speed { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+  .speed select { font: inherit; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--line); }
+
+  /* chat */
+  .chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+  .log { overflow: auto; padding: 24px 28px; display: flex; flex-direction: column; gap: 14px; scroll-behavior: smooth; }
+  .empty { margin: auto; text-align: center; color: var(--muted); max-width: 420px; }
+  .empty b { display: block; color: var(--ink); font-size: 22px; margin-bottom: 6px; }
+  .row { display: flex; flex-direction: column; max-width: 78%; }
+  .row.user { align-self: flex-end; align-items: flex-end; }
+  .row.bot { align-self: flex-start; }
+  .bubble { padding: 12px 16px; border-radius: 16px; white-space: pre-wrap; word-break: break-word; animation: pop .25s ease-out; }
+  .user .bubble { background: var(--user); color: var(--user-ink); border-bottom-right-radius: 4px; }
+  .bot .bubble { background: var(--bot); border-bottom-left-radius: 4px; }
+  .bot.blocked .bubble { background: var(--block-soft); border: 1px solid #f3c2c2; }
+  .bot.safe .bubble { background: var(--safe-soft); border: 1px solid #f1d2ad; }
+  .bot.unguarded .bubble { background: #fff4f4; border: 1px dashed var(--block); }
+  .redact { display: inline-block; filter: blur(5px); user-select: none; color: var(--ink); }
+  .redact-note { display: block; font-size: 13px; color: var(--block); margin-top: 6px; font-weight: 600; }
+  .who { font-size: 12px; color: var(--muted); margin: 0 6px 4px; }
+  .chip { margin-top: 6px; font-size: 13px; font-weight: 700; padding: 3px 10px; border-radius: 999px; display: inline-flex; gap: 6px; align-items: center; animation: pop .25s ease-out; }
+  .chip.pending { background: var(--bg); color: var(--muted); font-weight: 500; }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .a-allow { background: var(--allow-soft); color: var(--allow); }
+  .a-careful_answer { background: var(--careful-soft); color: var(--careful); }
+  .a-safe_answer { background: var(--safe-soft); color: var(--safe); }
+  .a-block { background: var(--block-soft); color: var(--block); }
+  .typing span { display: inline-block; width: 7px; height: 7px; margin: 0 2px; border-radius: 50%; background: var(--muted); animation: blink 1s infinite; }
+  .typing span:nth-child(2) { animation-delay: .15s; } .typing span:nth-child(3) { animation-delay: .3s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .25 } 40% { opacity: 1 } }
+  @keyframes pop { from { transform: translateY(6px); opacity: 0 } to { transform: none; opacity: 1 } }
+  .composer { display: flex; gap: 10px; padding: 14px 16px; border-top: 1px solid var(--line); }
+  .composer textarea { flex: 1; resize: none; height: 54px; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--line); font: inherit; color: var(--ink); background: var(--bg); }
+  .composer textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
+  /* guard panel */
+  .guard { display: flex; flex-direction: column; gap: 14px; padding: 18px; overflow: auto; }
+  .decision { border-radius: 12px; padding: 16px 18px; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; transition: background .3s; background: var(--bg); }
+  .decision .label { font-size: 30px; font-weight: 800; letter-spacing: -.02em; }
+  .decision .desc { grid-column: 1; color: var(--muted); font-size: 14px; }
+  .decision .score { grid-row: 1 / span 2; grid-column: 2; text-align: right; font-variant-numeric: tabular-nums; }
+  .decision .score b { display: block; font-size: 30px; }
+  .decision .score small { color: var(--muted); font-size: 13px; }
+  .decision.off { outline: 2px dashed var(--block); }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat { background: var(--bg); border-radius: 10px; padding: 8px 12px; }
+  .stat small { display: block; color: var(--muted); font-size: 12px; }
+  .stat b { font-size: 18px; font-variant-numeric: tabular-nums; }
+  .chartbox { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px 4px; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); flex-wrap: wrap; margin-bottom: 2px; }
+  .legend i { display: inline-block; width: 18px; height: 0; border-top: 2px dashed; vertical-align: middle; margin-right: 4px; }
+  svg text { font-family: var(--font); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th { text-align: right; color: var(--muted); font-weight: 600; font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  td { text-align: right; padding: 6px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child, th:last-child, td:last-child { text-align: left; }
+  tr.cur td { background: var(--accent-soft); }
+  .meta { font-size: 12px; color: var(--muted); margin-top: auto; }
+  .err { color: var(--block); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo"><span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6l8-3z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg></span>okchat 가드레일</div>
+    <span class="sub">한국어·영어 멀티턴 LLM 안전 가드레일 · 실시간 데모</span>
+    <span class="spacer"></span>
+    <span class="pill" id="pill-version">로딩 중…</span>
+    <span class="pill" id="pill-system"></span>
+    <div class="toggle">가드레일 <button class="switch on" id="guard-switch" aria-label="가드레일 켜기/끄기"></button></div>
+  </header>
+
+  <main>
+    <section class="card scen">
+      <h3>데모 시나리오</h3>
+      <div id="scen-list"></div>
+      <div class="caption" id="caption">시나리오를 고르거나 직접 입력해 보세요.</div>
+      <div class="ctrl">
+        <button class="btn primary" id="btn-play">▶ 자동 재생</button>
+        <button class="btn" id="btn-next">다음 턴 입력</button>
+        <button class="btn" id="btn-reset">대화 초기화</button>
+        <label class="speed">타이핑 속도
+          <select id="speed"><option value="45">보통</option><option value="25">빠르게</option><option value="70">느리게</option><option value="0">즉시</option></select>
+        </label>
+      </div>
+    </section>
+
+    <section class="card chat">
+      <div class="log" id="log">
+        <div class="empty" id="empty"><b>대화를 시작해 보세요</b>사용자의 모든 메시지를 지금까지의 대화 맥락과 함께 평가해 허용 · 주의 응답 · 안전 응답 · 차단 중 하나로 판정합니다.</div>
+      </div>
+      <form class="composer" id="composer">
+        <textarea id="input" placeholder="메시지를 입력하세요 (Enter 전송, Shift+Enter 줄바꿈)"></textarea>
+        <button class="btn primary" id="btn-send" type="submit">전송</button>
+      </form>
+    </section>
+
+    <section class="card guard">
+      <h3>가드레일 판정 · 마지막 사용자 턴</h3>
+      <div class="decision" id="decision">
+        <div class="label" id="d-label">대기 중</div>
+        <div class="score"><b id="d-score">–</b><small id="d-thr">임계값 –</small></div>
+        <div class="desc" id="d-desc">첫 메시지를 기다리고 있습니다.</div>
+      </div>
+      <div class="stats">
+        <div class="stat"><small>대화 언어</small><b id="s-lang">–</b></div>
+        <div class="stat"><small>판정 지연</small><b id="s-lat">–</b></div>
+        <div class="stat"><small>평가한 턴</small><b id="s-turns">0</b></div>
+      </div>
+      <div class="chartbox">
+        <h3>턴별 위험 점수</h3>
+        <div class="legend"><span><i style="border-color:var(--block)"></i>차단 임계값</span><span><i style="border-color:var(--safe)"></i>안전 응답 임계값</span><span id="lg-note"></span></div>
+        <svg id="chart" viewBox="0 0 520 230" width="100%" role="img" aria-label="턴별 위험 점수 그래프"></svg>
+      </div>
+      <div>
+        <h3>턴별 세부 점수</h3>
+        <table>
+          <thead><tr><th>턴</th><th title="미세조정 Qwen3Guard-8B: P(Unsafe)">가드 유해</th><th title="P(Controversial)">논쟁</th><th title="KcELECTRA 혐오표현 분류기">혐오</th><th title="과거 확인된 공격 사례와의 유사도 − 정상 사례와의 유사도 (+면 공격 쪽에 가까움)">메모리 차이</th><th>최종 점수</th><th>판정</th></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+      <div class="err" id="err"></div>
+      <div class="meta" id="meta"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+const ACT = {
+  allow:          { ko: "허용",          desc: "정상 대화로 판단해 그대로 답변합니다." },
+  careful_answer: { ko: "주의 응답",      desc: "민감할 수 있는 주제라 신중하게 답변합니다." },
+  safe_answer:    { ko: "안전 응답 + 검토", desc: "구체적 방법 없이 안전하게 답하고, 검토 대기열에 올립니다." },
+  block:          { ko: "차단",          desc: "유해한 요청으로 판단해 답변을 거부합니다." },
+};
+const LANG = { ko: "한국어", en: "영어", mixed: "혼합" };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (x) => (x === null || x === undefined ? "–" : Number(x).toFixed(2));
+
+let INFO = null, SCEN = [], cur = null, step = 0, msgs = [], turns = [], busy = false, playing = false, guardOn = true;
+
+async function init() {
+  try {
+    INFO = await (await fetch("api/info")).json();          // relative: also works under Jupyter /proxy/<port>/
+    SCEN = (await (await fetch("scenarios.json")).json()).scenarios;
+  } catch (e) { $("err").textContent = "서버에 연결할 수 없습니다: " + e; return; }
+  const v = $("pill-version");
+  v.textContent = INFO.backend === "mock" ? "MOCK · 실제 모델 아님" : "릴리스 " + INFO.version;
+  if (INFO.backend === "mock") v.classList.add("mock");
+  $("pill-system").textContent = INFO.decision_system === "stack" ? "판정: LightGBM 궤적 스택"
+    : INFO.decision_system === "guard" ? "판정: 미세조정 가드" : "판정: " + INFO.system;
+  $("meta").textContent = `모드 ${INFO.mode} · 시스템 ${INFO.system} · 응답 검사 ${INFO.response_check ? "켜짐" : "꺼짐"}`
+    + (INFO.chat_api ? " · 자유 입력 챗봇 연결됨" : "");
+  const list = $("scen-list");
+  list.style.display = "grid"; list.style.gap = "8px";
+  SCEN.forEach((s) => {
+    const b = document.createElement("button");
+    b.className = "sbtn"; b.textContent = s.title; b.dataset.id = s.id;
+    b.onclick = () => selectScenario(s.id);
+    list.appendChild(b);
+  });
+  drawChart();
+  syncButtons();
+}
+
+function selectScenario(id) {
+  if (busy || playing) return;
+  reset();
+  cur = SCEN.find((s) => s.id === id); step = 0;
+  document.querySelectorAll(".sbtn").forEach((b) => b.classList.toggle("active", b.dataset.id === id));
+  $("caption").textContent = cur.caption;
+  syncButtons();
+}
+
+function reset() {
+  msgs = []; turns = []; step = 0;
+  $("log").innerHTML = ""; $("log").appendChild(emptyNode());
+  $("tbody").innerHTML = ""; $("err").textContent = "";
+  setDecision(null); $("s-lang").textContent = "–"; $("s-lat").textContent = "–"; $("s-turns").textContent = "0";
+  drawChart(); syncButtons();
+}
+function emptyNode() {
+  const d = document.createElement("div"); d.className = "empty"; d.id = "empty";
+  d.innerHTML = "<b>대화를 시작해 보세요</b>사용자의 모든 메시지를 지금까지의 대화 맥락과 함께 평가해 허용 · 주의 응답 · 안전 응답 · 차단 중 하나로 판정합니다.";
+  return d;
+}
+
+function syncButtons() {
+  const more = cur && step < cur.turns.length;
+  $("btn-play").disabled = !more || busy || playing;
+  $("btn-next").disabled = !more || busy || playing;
+  $("btn-send").disabled = busy || playing;
+  $("btn-reset").disabled = busy || playing;
+  $("btn-play").textContent = playing ? "재생 중…" : "▶ 자동 재생";
+}
+
+function addRow(role, html, cls = "") {
+  $("empty")?.remove();
+  const row = document.createElement("div");
+  row.className = `row ${role} ${cls}`;
+  row.innerHTML = `<div class="who">${role === "user" ? "사용자" : guardOn ? "챗봇 (가드레일 적용)" : "챗봇 (가드레일 없음)"}</div><div class="bubble">${html}</div>`;
+  $("log").appendChild(row);
+  $("log").scrollTop = $("log").scrollHeight;
+  return row;
+}
+
+function replyHtml(text) {
+  const m = text.match(/^\[(데모용 가림 처리[^\]]*)\]$/);
+  if (!m) return esc(text);
+  return `<span class="redact">이 부분은 유해한 답변 내용이 들어가는 자리이므로 영상에서는 가립니다 가립니다 가립니다</span>`
+       + `<span class="redact-note">⚠ ${esc(m[1].replace("데모용 가림 처리 — ", ""))}</span>`;
+}
+
+async function typeInto(text) {
+  const ms = Number($("speed").value), box = $("input");
+  box.value = "";
+  if (!ms) { box.value = text; return; }
+  for (const ch of text) { box.value += ch; box.scrollTop = box.scrollHeight; await sleep(ms); }
+  await sleep(250);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function send(text, draft = null) {
+  text = text.trim();
+  if (!text || busy) return;
+  busy = true; syncButtons(); $("err").textContent = "";
+  $("input").value = "";
+  msgs.push({ role: "user", content: text });
+  const urow = addRow("user", esc(text));
+  const chip = document.createElement("span");
+  chip.className = "chip pending"; chip.textContent = "판정 중…";
+  urow.appendChild(chip);
+  const brow = addRow("bot", '<span class="typing"><span></span><span></span><span></span></span>');
+  try {
+    const r = await fetch("api/turn", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: msgs, draft, guard_on: guardOn }) });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error || r.status);
+    turns = res.turns;
+    const last = turns[turns.length - 1];
+    chip.className = "chip a-" + last.action;
+    chip.innerHTML = `<span class="dot"></span>${guardOn ? "" : "판정만 · "}${ACT[last.action].ko} · ${fmt(last.p_block)}`;
+    const reply = res.reply;
+    const cls = !guardOn && /^\[데모용/.test(reply.text) ? "unguarded"
+      : reply.source === "guard" ? (last.action === "block" ? "blocked" : "safe")
+      : reply.source === "replaced" ? "safe" : "";
+    brow.className = `row bot ${cls}`;
+    brow.querySelector(".who").textContent = guardOn ? "챗봇 (가드레일 적용)" : "챗봇 (가드레일 없음)";
+    brow.querySelector(".bubble").innerHTML = replyHtml(reply.text)
+      + (reply.source === "replaced" ? '<span class="redact-note">응답 검사: 초안이 위험해 안전 응답으로 교체</span>' : "");
+    msgs.push({ role: "assistant", content: reply.text });
+    setDecision(last, res.latency_ms);
+    renderTable(); drawChart();
+    if (last.error) $("err").textContent = "가드 오류 → 기본 동작 적용: " + last.error;
+  } catch (e) {
+    chip.className = "chip pending"; chip.textContent = "오류";
+    brow.remove(); msgs.pop();
+    $("err").textContent = "판정 실패: " + e.message;
+  }
+  $("log").scrollTop = $("log").scrollHeight;
+  busy = false; syncButtons();
+}
+
+function setDecision(t, lat) {
+  const d = $("decision");
+  d.className = "decision" + (t ? " a-" + t.action : "") + (t && !guardOn ? " off" : "");
+  if (!t) {
+    $("d-label").textContent = "대기 중"; $("d-desc").textContent = "첫 메시지를 기다리고 있습니다.";
+    $("d-score").textContent = "–"; $("d-thr").textContent = "임계값 –"; return;
+  }
+  $("d-label").textContent = ACT[t.action].ko;
+  $("d-desc").textContent = guardOn ? ACT[t.action].desc : "가드레일이 꺼져 있어 판정은 표시만 하고 챗봇 답변을 그대로 내보냅니다.";
+  $("d-score").textContent = fmt(t.p_block);
+  $("d-thr").textContent = "차단 임계값 " + fmt(t.threshold);
+  $("s-lang").textContent = LANG[t.lang] || t.lang;
+  $("s-lat").textContent = lat !== undefined ? Math.round(lat) + " ms" : "–";
+  $("s-turns").textContent = turns.length;
+}
+
+// The stack's memory feature is the margin (mem_margin), not the raw max similarity, which sits near 0.9 for any text.
+function memMargin(t) {
+  if (t.mem_attack == null || t.mem_benign == null) return "–";
+  const m = t.mem_attack - t.mem_benign;
+  return (m > 0 ? "+" : m < 0 ? "−" : "") + Math.abs(m).toFixed(2);
+}
+
+function renderTable() {
+  $("tbody").innerHTML = turns.map((t, i) => `<tr class="${i === turns.length - 1 ? "cur" : ""}">
+    <td>${t.turn + 1}</td><td>${fmt(t.p_unsafe)}</td><td>${fmt(t.p_contro)}</td><td>${fmt(t.hate)}</td>
+    <td>${memMargin(t)}</td><td><b>${fmt(t.p_block)}</b></td>
+    <td><span class="chip a-${t.action}" style="margin:0"><span class="dot"></span>${ACT[t.action].ko}</span></td></tr>`).join("");
+}
+
+function drawChart() {
+  const W = 520, H = 230, L = 40, R = 14, T = 12, B = 32, svg = $("chart");
+  const n = Math.max(turns.length, cur ? cur.turns.length : 3, 3);
+  const vals = turns.map((t) => t.p_block ?? 0);
+  const thr = turns.length ? turns[turns.length - 1] : null;
+  const lang = thr ? thr.lang : "ko";
+  const tb = thr ? thr.threshold : INFO?.thresholds?.[lang]?.block;
+  const ts = thr ? thr.safe_threshold : INFO?.thresholds?.[lang]?.safe_answer;
+  const ymax = Math.max(1, ...vals, tb || 0, ts || 0) * 1.0;
+  const x = (i) => L + (n === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (n - 1));
+  const y = (v) => T + (1 - v / ymax) * (H - T - B);
+  const col = { allow: "var(--allow)", careful_answer: "var(--careful)", safe_answer: "var(--safe)", block: "var(--block)" };
+  let s = "";
+  for (let k = 0; k <= 4; k++) {
+    const v = (ymax * k) / 4;
+    s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/>`
+       + `<text x="${L - 8}" y="${y(v) + 4}" font-size="11" text-anchor="end" fill="var(--muted)">${v.toFixed(2)}</text>`;
+  }
+  for (let i = 0; i < n; i++) s += `<text x="${x(i)}" y="${H - 10}" font-size="12" text-anchor="middle" fill="var(--muted)">${i + 1}턴</text>`;
+  if (ts != null) s += `<line x1="${L}" x2="${W - R}" y1="${y(ts)}" y2="${y(ts)}" stroke="var(--safe)" stroke-width="2" stroke-dasharray="6 5"/>`;
+  if (tb != null) s += `<line x1="${L}" x2="${W - R}" y1="${y(tb)}" y2="${y(tb)}" stroke="var(--block)" stroke-width="2" stroke-dasharray="6 5"/>`;
+  if (vals.length) {
+    const pts = vals.map((v, i) => `${x(i)},${y(v)}`).join(" ");
+    s += `<polygon points="${x(0)},${y(0)} ${pts} ${x(vals.length - 1)},${y(0)}" fill="var(--accent)" opacity=".08"/>`;
+    s += `<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linejoin="round"/>`;
+    turns.forEach((t, i) => {
+      s += `<circle cx="${x(i)}" cy="${y(vals[i])}" r="7" fill="${col[t.action]}" stroke="#fff" stroke-width="2.5"/>`
+         + `<text x="${x(i)}" y="${y(vals[i]) - 13}" font-size="12" font-weight="700" text-anchor="middle" fill="${col[t.action]}">${vals[i].toFixed(2)}</text>`;
+    });
+  }
+  svg.innerHTML = s;
+  $("lg-note").textContent = thr ? `(${LANG[lang] || lang} 기준, 오탐률 1% 예산)` : "";
+}
+
+async function nextTurn(auto) {
+  if (!cur || step >= cur.turns.length || busy) return;
+  const t = cur.turns[step++];
+  await typeInto(t.user);
+  await send(t.user, t.draft ?? null);
+  syncButtons();
+}
+
+$("btn-next").onclick = () => nextTurn(false);
+$("btn-play").onclick = async () => {
+  if (!cur) return;
+  playing = true; syncButtons();
+  while (cur && step < cur.turns.length) { await nextTurn(true); await sleep(1400); }
+  playing = false; syncButtons();
+};
+$("btn-reset").onclick = () => { const id = cur?.id; reset(); if (id) { step = 0; $("caption").textContent = cur.caption; syncButtons(); } };
+$("guard-switch").onclick = () => {
+  if (busy || playing) return;
+  guardOn = !guardOn;
+  $("guard-switch").classList.toggle("on", guardOn);
+  reset(); if (cur) $("caption").textContent = cur.caption;
+};
+$("composer").onsubmit = (e) => { e.preventDefault(); if (!playing) send($("input").value); };
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!playing) send($("input").value); }
+});
+init();
+</script>
+</body>
+</html>
